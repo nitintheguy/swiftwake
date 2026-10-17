@@ -11,6 +11,12 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+
+// Import shipment routes
+const shipmentRoutes = require('./routes/shipments');
+app.use('/api', shipmentRoutes);
+
+
 // Test route to check server and database health
 app.get('/api/health', async (req, res) => {
   try {
