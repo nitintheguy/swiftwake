@@ -46,45 +46,90 @@ router.post('/shipments', verifyToken, verifyRole(['dispatcher', 'admin']), asyn
     }
 });
 
-// GET /api/shipments - Retrieve shipments (Customers only see their own; Staff see all)
+// GET /api/shipments - Retrieve shipments with role scoping, status filtering, and pagination
 router.get('/shipments', verifyToken, async (req, res) => {
     try {
-        let query;
-        let queryParams = [];
+        let { status, page = 1, limit = 10 } = req.query;
 
+        // Parse pagination integers safely
+        page = parseInt(page, 10);
+        limit = parseInt(limit, 10);
+        const offset = (page - 1) * limit;
+
+        let conditions = [];
+        let values = [];
+        let paramIndex = 1;
+
+        // Base SELECT query with JOIN
+        let query = `
+            SELECT s.*, u.name AS sender_name, u.email AS sender_email 
+            FROM shipments s
+            JOIN users u ON s.sender_id = u.user_id
+        `;
+
+        // 1. Role-based scoping: Customers only see their own shipments
         if (req.user.role === 'customer') {
-            // Customers are restricted to viewing only their own parcels
-            query = `
-                SELECT s.*, u.name AS sender_name, u.email AS sender_email 
-                FROM shipments s
-                JOIN users u ON s.sender_id = u.user_id
-                WHERE s.sender_id = $1
-                ORDER BY s.created_at DESC;
-            `;
-            queryParams = [req.user.user_id];
-        } else {
-            // Admins, dispatchers, and drivers have a global view
-            query = `
-                SELECT s.*, u.name AS sender_name, u.email AS sender_email 
-                FROM shipments s
-                JOIN users u ON s.sender_id = u.user_id
-                ORDER BY s.created_at DESC;
-            `;
+            conditions.push(`s.sender_id = $${paramIndex++}`);
+            values.push(req.user.user_id);
         }
 
-        const result = await db.query(query, queryParams);
+        // 2. Optional status filter (e.g., ?status=Order Created)
+        if (status) {
+            conditions.push(`s.current_status = $${paramIndex++}`);
+            values.push(status);
+        }
+
+        // Append WHERE clause if conditions exist
+        if (conditions.length > 0) {
+            query += ` WHERE ` + conditions.join(' AND ');
+        }
+
+        // Add sorting, limit, and offset
+        query += ` ORDER BY s.created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++};`;
+        values.push(limit, offset);
+
+        // Fetch paginated records
+        const result = await db.query(query, values);
+
+        // 3. Fetch total count for pagination metadata
+        let countQuery = `SELECT COUNT(*) FROM shipments s`;
+        let countValues = [];
+        let countParamIndex = 1;
+        let countConditions = [];
+
+        if (req.user.role === 'customer') {
+            countConditions.push(`s.sender_id = $${countParamIndex++}`);
+            countValues.push(req.user.user_id);
+        }
+        if (status) {
+            countConditions.push(`s.current_status = $${countParamIndex++}`);
+            countValues.push(status);
+        }
+        if (countConditions.length > 0) {
+            countQuery += ` WHERE ` + countConditions.join(' AND ');
+        }
+
+        const countResult = await db.query(countQuery, countValues);
+        const totalCount = parseInt(countResult.rows[0].count, 10);
 
         return res.status(200).json({
+            pagination: {
+                page,
+                limit,
+                total_count: totalCount,
+                total_pages: Math.ceil(totalCount / limit)
+            },
             count: result.rows.length,
             shipments: result.rows
         });
+
     } catch (error) {
-        console.error('Error fetching shipments:', error.message);
+        console.error('Error fetching shipments with pagination:', error.message);
         return res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// GET /api/shipments/:tracking_number - Retrieve a single shipment by tracking number
+// GET /api/shipments/:tracking_number - Retrieve a single shipment by tracking number (Public Guest Lookup)
 router.get('/shipments/:tracking_number', async (req, res) => {
     try {
         const { tracking_number } = req.params;
@@ -115,16 +160,14 @@ router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 
     try {
         const { shipment_id } = req.params;
         const { location_hub, scan_status } = req.body;
-        const scanned_by = req.user.user_id; // Securely pulled from the authenticated token!
+        const scanned_by = req.user.user_id; // Securely pulled from token
 
-        // Basic validation
         if (!location_hub || !scan_status) {
             return res.status(400).json({ 
                 error: 'Missing required fields: location_hub, scan_status' 
             });
         }
 
-        // 1. Verify the shipment exists before scanning
         const shipmentCheck = await db.query(
             'SELECT * FROM shipments WHERE shipment_id = $1', 
             [shipment_id]
@@ -134,7 +177,6 @@ router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 
             return res.status(404).json({ error: 'Shipment not found' });
         }
 
-        // 2. Insert the scan event into the audit log
         const scanQuery = `
             INSERT INTO scan_events (shipment_id, location_hub, scan_status, scanned_by)
             VALUES ($1, $2, $3, $4)
@@ -143,7 +185,6 @@ router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 
         const scanValues = [shipment_id, location_hub, scan_status, scanned_by];
         const newScan = await db.query(scanQuery, scanValues);
 
-        // 3. Automatically update the shipment's current status and updated_at timestamp
         const updateShipmentQuery = `
             UPDATE shipments 
             SET current_status = $1, updated_at = CURRENT_TIMESTAMP 
@@ -161,7 +202,6 @@ router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 
     } catch (error) {
         console.error('Error logging scan event:', error.message);
 
-        // Handle foreign key violation if scanned_by user doesn't exist
         if (error.code === '23503') {
             return res.status(400).json({ error: 'Invalid user reference: User does not exist.' });
         }
