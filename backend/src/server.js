@@ -16,6 +16,10 @@ app.use(express.json());
 const shipmentRoutes = require('./routes/shipments');
 app.use('/api', shipmentRoutes);
 
+// Import auth routes
+const authRoutes = require('./routes/auth');
+app.use('/api/auth', authRoutes);
+
 
 // Test route to check server and database health
 app.get('/api/health', async (req, res) => {

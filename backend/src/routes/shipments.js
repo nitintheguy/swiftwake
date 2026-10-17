@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db'); // Points to your db.js pool
+const { verifyToken, verifyRole } = require('../middleware/auth');
 
-// POST /api/shipments - Create a new shipment
-router.post('/shipments', async (req, res) => {
+// POST /api/shipments - Only dispatchers and admins can create shipments
+router.post('/shipments', verifyToken, verifyRole(['dispatcher', 'admin']), async (req, res) => {
     try {
         const { tracking_number, sender_id, recipient_name, destination_address } = req.body;
 
@@ -43,17 +44,35 @@ router.post('/shipments', async (req, res) => {
 
         return res.status(500).json({ error: 'Internal server error' });
     }
-    
 });
-router.get('/shipments', async (req, res) => {
+
+// GET /api/shipments - Retrieve shipments (Customers only see their own; Staff see all)
+router.get('/shipments', verifyToken, async (req, res) => {
     try {
-        const query = `
-            SELECT s.*, u.name AS sender_name, u.email AS sender_email 
-            FROM shipments s
-            JOIN users u ON s.sender_id = u.user_id
-            ORDER BY s.created_at DESC;
-        `;
-        const result = await db.query(query);
+        let query;
+        let queryParams = [];
+
+        if (req.user.role === 'customer') {
+            // Customers are restricted to viewing only their own parcels
+            query = `
+                SELECT s.*, u.name AS sender_name, u.email AS sender_email 
+                FROM shipments s
+                JOIN users u ON s.sender_id = u.user_id
+                WHERE s.sender_id = $1
+                ORDER BY s.created_at DESC;
+            `;
+            queryParams = [req.user.user_id];
+        } else {
+            // Admins, dispatchers, and drivers have a global view
+            query = `
+                SELECT s.*, u.name AS sender_name, u.email AS sender_email 
+                FROM shipments s
+                JOIN users u ON s.sender_id = u.user_id
+                ORDER BY s.created_at DESC;
+            `;
+        }
+
+        const result = await db.query(query, queryParams);
 
         return res.status(200).json({
             count: result.rows.length,
@@ -91,16 +110,17 @@ router.get('/shipments/:tracking_number', async (req, res) => {
     }
 });
 
-// POST /api/shipments/:shipment_id/scans - Log a new tracking audit checkpoint
-router.post('/shipments/:shipment_id/scans', async (req, res) => {
+// POST /api/shipments/:shipment_id/scans - Log a new tracking audit checkpoint (Staff only)
+router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 'dispatcher', 'admin']), async (req, res) => {
     try {
         const { shipment_id } = req.params;
-        const { location_hub, scan_status, scanned_by } = req.body;
+        const { location_hub, scan_status } = req.body;
+        const scanned_by = req.user.user_id; // Securely pulled from the authenticated token!
 
         // Basic validation
-        if (!location_hub || !scan_status || !scanned_by) {
+        if (!location_hub || !scan_status) {
             return res.status(400).json({ 
-                error: 'Missing required fields: location_hub, scan_status, scanned_by' 
+                error: 'Missing required fields: location_hub, scan_status' 
             });
         }
 
@@ -143,7 +163,7 @@ router.post('/shipments/:shipment_id/scans', async (req, res) => {
 
         // Handle foreign key violation if scanned_by user doesn't exist
         if (error.code === '23503') {
-            return res.status(400).json({ error: 'Invalid scanned_by user ID: User does not exist.' });
+            return res.status(400).json({ error: 'Invalid user reference: User does not exist.' });
         }
 
         return res.status(500).json({ error: 'Internal server error' });
