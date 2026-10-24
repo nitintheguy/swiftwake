@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const redisClient = require('./config/redis');
 require('dotenv').config();
 
 const db = require('./db'); // Imports our postgres connection pool

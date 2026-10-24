@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db'); // Points to your db.js pool
+const redisClient = require('../config/redis'); // Import our Redis client
 const { verifyToken, verifyRole } = require('../middleware/auth');
 
 // POST /api/shipments - Only dispatchers and admins can create shipments
@@ -32,12 +33,10 @@ router.post('/shipments', verifyToken, verifyRole(['dispatcher', 'admin']), asyn
     } catch (error) {
         console.error('Error creating shipment:', error.message);
         
-        // Handle unique violation (e.g., duplicate tracking number)
         if (error.code === '23505') {
             return res.status(409).json({ error: 'A shipment with this tracking number already exists.' });
         }
         
-        // Handle foreign key violation (e.g., sender_id doesn't exist in users table)
         if (error.code === '23503') {
             return res.status(400).json({ error: 'Invalid sender_id: User does not exist.' });
         }
@@ -51,7 +50,6 @@ router.get('/shipments', verifyToken, async (req, res) => {
     try {
         let { status, page = 1, limit = 10 } = req.query;
 
-        // Parse pagination integers safely
         page = parseInt(page, 10);
         limit = parseInt(limit, 10);
         const offset = (page - 1) * limit;
@@ -60,38 +58,31 @@ router.get('/shipments', verifyToken, async (req, res) => {
         let values = [];
         let paramIndex = 1;
 
-        // Base SELECT query with JOIN
         let query = `
             SELECT s.*, u.name AS sender_name, u.email AS sender_email 
             FROM shipments s
             JOIN users u ON s.sender_id = u.user_id
         `;
 
-        // 1. Role-based scoping: Customers only see their own shipments
         if (req.user.role === 'customer') {
             conditions.push(`s.sender_id = $${paramIndex++}`);
             values.push(req.user.user_id);
         }
 
-        // 2. Optional status filter (e.g., ?status=Order Created)
         if (status) {
             conditions.push(`s.current_status = $${paramIndex++}`);
             values.push(status);
         }
 
-        // Append WHERE clause if conditions exist
         if (conditions.length > 0) {
             query += ` WHERE ` + conditions.join(' AND ');
         }
 
-        // Add sorting, limit, and offset
         query += ` ORDER BY s.created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++};`;
         values.push(limit, offset);
 
-        // Fetch paginated records
         const result = await db.query(query, values);
 
-        // 3. Fetch total count for pagination metadata
         let countQuery = `SELECT COUNT(*) FROM shipments s`;
         let countValues = [];
         let countParamIndex = 1;
@@ -129,11 +120,24 @@ router.get('/shipments', verifyToken, async (req, res) => {
     }
 });
 
-// GET /api/shipments/:tracking_number - Retrieve a single shipment by tracking number (Public Guest Lookup)
+// GET /api/shipments/:tracking_number - Retrieve a single shipment by tracking number (With Redis Cache-Aside)
 router.get('/shipments/:tracking_number', async (req, res) => {
     try {
         const { tracking_number } = req.params;
+        const cacheKey = `shipment:tracking:${tracking_number}`;
 
+        // 1. Check Redis Cache First (Cache Hit)
+        const cachedData = await redisClient.get(cacheKey);
+        if (cachedData) {
+            console.log(`[Cache Hit] Serving tracking number ${tracking_number} from Redis`);
+            return res.status(200).json({
+                source: 'cache',
+                shipment: JSON.parse(cachedData)
+            });
+        }
+
+        // 2. Cache Miss: Query PostgreSQL
+        console.log(`[Cache Miss] Fetching tracking number ${tracking_number} from PostgreSQL`);
         const query = `
             SELECT s.*, u.name AS sender_name, u.email AS sender_email 
             FROM shipments s
@@ -146,8 +150,14 @@ router.get('/shipments/:tracking_number', async (req, res) => {
             return res.status(404).json({ error: 'Shipment not found' });
         }
 
+        const shipment = result.rows[0];
+
+        // 3. Store result in Redis with a 60-second TTL (Time-To-Live)
+        await redisClient.setex(cacheKey, 60, JSON.stringify(shipment));
+
         return res.status(200).json({
-            shipment: result.rows[0]
+            source: 'database',
+            shipment: shipment
         });
     } catch (error) {
         console.error('Error fetching shipment:', error.message);
@@ -155,12 +165,12 @@ router.get('/shipments/:tracking_number', async (req, res) => {
     }
 });
 
-// POST /api/shipments/:shipment_id/scans - Log a new tracking audit checkpoint (Staff only)
+// POST /api/shipments/:shipment_id/scans - Log a new tracking audit checkpoint (Staff only with Cache Invalidation)
 router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 'dispatcher', 'admin']), async (req, res) => {
     try {
         const { shipment_id } = req.params;
         const { location_hub, scan_status } = req.body;
-        const scanned_by = req.user.user_id; // Securely pulled from token
+        const scanned_by = req.user.user_id;
 
         if (!location_hub || !scan_status) {
             return res.status(400).json({ 
@@ -177,6 +187,8 @@ router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 
             return res.status(404).json({ error: 'Shipment not found' });
         }
 
+        const existingShipment = shipmentCheck.rows[0];
+
         const scanQuery = `
             INSERT INTO scan_events (shipment_id, location_hub, scan_status, scanned_by)
             VALUES ($1, $2, $3, $4)
@@ -192,6 +204,9 @@ router.post('/shipments/:shipment_id/scans', verifyToken, verifyRole(['driver', 
             RETURNING *;
         `;
         const updatedShipment = await db.query(updateShipmentQuery, [scan_status, shipment_id]);
+
+        // 4. Cache Invalidation: Clear old cached entry so future lookups get the fresh status immediately
+        await redisClient.del(`shipment:tracking:${existingShipment.tracking_number}`);
 
         return res.status(201).json({
             message: 'Scan event logged successfully',
